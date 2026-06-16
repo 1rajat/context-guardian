@@ -1,229 +1,221 @@
-# llm-stress-test
+# context-guardian
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
-[![CI](https://github.com/your-org/llm-stress-test/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/llm-stress-test/actions)
 
-**Needle-in-a-haystack context window benchmarking for any LLM.**
+> The first Python package that detects context blindness in your LLM app — silently, in real time.
 
-Hides a secret fact at different positions inside increasingly large documents, then asks the model to find it. Reveals exactly where — and at what context length — your model starts to fail.
+Every LLM observability tool tracks cost, latency, and errors.  
+Nobody tracks whether your model actually **read** what you gave it.
 
-<!-- Add heatmap GIF here -->
+**context-guardian** watches every LLM call and tells you when:
+- Your answer was buried in a position the model tends to ignore
+- The model responded but silently ignored the context
+- Your RAG pipeline is feeding content into a known blind spot
+
+```
+pip install context-guardian
+```
 
 ---
 
-## What does this test?
+## 2-line integration
 
-LLMs don't read documents uniformly. Research shows that models perform worse when relevant information is buried in the **middle** of a long context — they over-attend to the beginning and end. This is the ["lost in the middle" problem](https://arxiv.org/abs/2307.03172).
+```python
+import openai
+from context_guardian import Guardian
 
-This tool quantifies that degradation cell by cell:
+# Before:
+# client = openai.OpenAI()
 
-- **X-axis** — context length (1k → 128k tokens)
-- **Y-axis** — where in the document the key fact is hidden (0% = start, 100% = end)
-- **Color** — retrieval score (green = found it, red = failed)
+# After — one word change:
+client = Guardian(openai.OpenAI(), model="gpt-4o")
 
-A perfect model is uniformly green. Real models show a red band in the middle at large context sizes.
+# Everything else is identical
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {"role": "system", "content": very_long_system_prompt},
+        {"role": "user", "content": "What does clause 14 say about termination?"}
+    ]
+)
+```
+
+Guardian intercepts the call, runs all three analysis layers locally, and prints a warning:
+
+```
+╭─ context-guardian ─────────────────────────────────────────╮
+│ ⚠  HIGH RISK  │ Depth: 44% │ Tokens: 28,432               │
+│ Faithfulness: 0.71  — answer may not use context           │
+│ 💡 Move relevant content from 44% depth to end of context  │
+╰────────────────────────────────────────────────────────────╯
+```
+
+Zero perceived latency — analysis runs in a background thread.
+
+---
+
+## What it catches that nothing else does
+
+Most observability tools tell you **what** was called and **how long** it took.  
+context-guardian tells you **whether the model actually used what you gave it**.
+
+| What it detects | How |
+|---|---|
+| Content in the model's attention blind zone | Semantic depth analysis + risk tables from real stress tests |
+| Model responded but ignored context | Local faithfulness scoring (no extra API call) |
+| Your app's specific failure patterns | Learns from your call history over time |
+
+---
+
+## Three APIs — pick the one that fits your code
+
+### API 1 — Drop-in client wrapper
+
+```python
+from context_guardian import Guardian
+import openai
+
+client = Guardian(openai.OpenAI(), model="gpt-4o", report="inline")
+response = client.chat.completions.create(...)
+```
+
+Works with `openai.OpenAI()` and `anthropic.Anthropic()`.
+
+### API 2 — Context manager
+
+```python
+from context_guardian import ContextWatcher
+
+watcher = ContextWatcher(model="gpt-4o", report="end")
+
+with watcher.watch():
+    r1 = client.chat.completions.create(...)
+    r2 = client.chat.completions.create(...)
+
+report = watcher.report()  # prints table + returns structured dict
+```
+
+### API 3 — Decorator
+
+```python
+from context_guardian import watch_llm
+
+@watch_llm(model="gpt-4o", report="inline", app="my-contract-bot")
+def review_contract(contract: str, question: str) -> str:
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": contract + "\n\n" + question}]
+    )
+    return response.choices[0].message.content
+```
+
+---
+
+## Report modes
+
+| Mode | Latency added | When to use |
+|---|---|---|
+| `inline` (default) | ~150ms background | Development, debugging |
+| `end` | ~0ms perceived | End-of-function summary |
+| `silent` | ~0ms | CI/CD — logs to session only |
+| `json` | ~150ms background | Machine-readable pipeline integration |
+
+---
+
+## How it works
+
+### Layer 1 — Semantic Relevance Mapping
+
+Uses `sentence-transformers` (all-MiniLM-L6-v2, runs locally, free, ~90MB) to embed both the user's question and every chunk of context. Finds where the most relevant content sits, then looks up that depth in pre-computed model risk tables derived from real needle-in-haystack stress tests.
+
+> "Your most relevant content is at 44% depth → HIGH RISK for gpt-4o at 28k tokens"
+
+### Layer 2 — Faithfulness Judge
+
+After the model responds, runs a local check with no extra API call:
+- Extracts key claims from the response
+- Checks if each claim is grounded in the context via cosine similarity
+- Scores 0.0–1.0: 1.0 = fully grounded, 0.0 = ignored context
+
+This catches **silent hallucination** — when the model had the answer but didn't use it.
+
+### Layer 3 — Session Memory
+
+Persists every call to `~/.context_guardian/sessions/{app}.jsonl`. After 10+ calls it computes per-depth-zone failure rates for your specific app. After 50+ calls it emits personalised warnings:
+
+> "In YOUR pipeline: content at 40–60% depth fails 67% of the time at >16k tokens"
+
+```python
+from context_guardian import Session
+s = Session("my-contract-bot")
+s.print_summary()
+```
+
+---
+
+## CLI
+
+```bash
+# Run a Python script and report context risks after it exits
+context-guardian watch script.py --model gpt-4o --report end
+
+# Show session history
+context-guardian session show --app my-contract-bot
+
+# Clear session history
+context-guardian session clear --app my-contract-bot
+
+# List all apps with history
+context-guardian session list
+
+# Generate report from a saved JSONL session file
+context-guardian report results/session.jsonl
+```
+
+---
+
+## The stress tester (advanced)
+
+The original needle-in-haystack CLI is still available — it's what generated the risk tables:
+
+```bash
+# Quick test against your Ollama model
+llm-stress-test run --model llama3.2 --quick
+
+# Demo mode — no API key needed
+llm-stress-test run --model gpt-4o --demo
+
+# Full test with heatmap
+llm-stress-test run --model gpt-4o --context-lengths 4k,16k,32k,64k
+
+# Cost estimate before running
+llm-stress-test run --model gpt-4o --cost-estimate
+```
+
+See [RESULTS.md](RESULTS.md) for community-submitted benchmark results.
 
 ---
 
 ## Installation
 
-**Requirements:** Python 3.9+, git
+```bash
+pip install context-guardian
+
+# sentence-transformers downloads all-MiniLM-L6-v2 on first use (~90MB, one-time)
+```
+
+**Requirements:** Python 3.9+, openai >= 1.0 or anthropic >= 0.20
+
+---
+
+## Contributing
 
 ```bash
-git clone https://github.com/your-org/llm-stress-test
-cd llm-stress-test
-pip install -e .
+git clone https://github.com/1rajat/context-guardian
+cd context-guardian
+pip install -e ".[dev]"
+pytest
 ```
 
-Verify the install:
-
-```bash
-llm-stress-test --version
-llm-stress-test list-models
-```
-
----
-
-## Quick start — pick your provider
-
-### Option A — Ollama (free, local, no account needed)
-
-Best way to start. No API key, no cost, runs entirely on your machine.
-
-**1. Install Ollama**
-
-```bash
-# macOS
-brew install ollama
-
-# Linux
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-**2. Pull a model and start the server**
-
-```bash
-ollama pull llama3.2:3b      # small, fast (~2 GB)
-# or
-ollama pull qwen2.5:14b      # more capable (~9 GB)
-
-ollama serve                  # starts the local API on http://localhost:11434
-```
-
-**3. Run the stress test**
-
-```bash
-llm-stress-test run --model llama3.2:3b --quick --trials 1
-```
-
----
-
-### Option B — OpenAI
-
-```bash
-export OPENAI_API_KEY=sk-...
-
-# Check cost first (no API calls made)
-llm-stress-test run --model gpt-4o-mini --quick --cost-estimate
-
-# Run
-llm-stress-test run --model gpt-4o-mini --quick --trials 3
-```
-
-Supported models: `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `gpt-3.5-turbo`
-
----
-
-### Option C — Anthropic
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-
-llm-stress-test run --model claude-3-5-sonnet --quick --trials 3
-```
-
-Supported models: `claude-3-5-sonnet`, `claude-3-5-haiku-20241022`, `claude-3-opus`
-
----
-
-## What you get after every run
-
-Three files land in `results/` automatically:
-
-| File | What it is |
-|------|-----------|
-| `run_{model}_{timestamp}.json` | Raw scores — every trial, every cell |
-| `heatmap_{model}_{timestamp}.png` | Static PNG heatmap (150 DPI, shareable) |
-| `heatmap_{model}_{timestamp}.html` | Interactive Plotly heatmap — hover cells for details |
-
-Plus a live ASCII heatmap printed directly in the terminal as soon as the run finishes.
-
----
-
-## More commands
-
-```bash
-# Full run — all context lengths up to 32k, 3 trials per cell
-llm-stress-test run --model llama3.2:3b --max-context 32k --trials 3
-
-# Custom context lengths and depths
-llm-stress-test run --model gpt-4o --context-lengths 4k,16k,64k --depths 0,25,50,75,100
-
-# Estimate API cost before spending money (OpenAI/Anthropic only)
-llm-stress-test run --model gpt-4o --max-context 64k --cost-estimate
-
-# Regenerate heatmaps from a saved JSON (no API calls)
-llm-stress-test plot results/run_llama3.2_3b_20241215.json
-
-# Side-by-side comparison of two models
-llm-stress-test compare results/run_llama3.2_3b_*.json results/run_qwen2.5_14b_*.json
-
-# List all known models with max context and provider
-llm-stress-test list-models
-```
-
----
-
-## CLI reference
-
-```
-llm-stress-test run [OPTIONS]
-  --model / -m          Model name (required)
-  --max-context         Cap context size, e.g. 32k
-  --context-lengths     Custom comma-separated list: 4k,16k,32k
-  --depths              Custom depth percents: 0,25,50,75,100
-  --trials / -t         Trials per cell (default: 3)
-  --output / -o         Output directory (default: results/)
-  --quick               4 lengths × 3 depths — fast sanity check
-  --cost-estimate       Print cost estimate and exit without running
-  --no-html             Skip interactive HTML heatmap
-  --no-png              Skip PNG heatmap
-  --ollama-url          Ollama base URL (default: http://localhost:11434)
-
-llm-stress-test plot JSON_FILE
-  Regenerate PNG + HTML from a saved result file.
-
-llm-stress-test compare FILE1 FILE2 ...
-  Side-by-side interactive heatmap of two or more result files.
-
-llm-stress-test list-models
-  List known models with provider and max context size.
-```
-
----
-
-## How scoring works
-
-Each (context length × depth) cell runs `--trials` independent calls and averages the scores.
-
-The needle is one unmistakable sentence hidden in the filler document:
-
-> *"The secret code word is: FLAMINGO-7429"*
-
-The model is asked: *"What is the secret code word mentioned in the document?"*
-
-| Score | Meaning |
-|-------|---------|
-| 1.00 | Perfect — exact code word returned |
-| 0.50 | Partial — found one component (e.g. "FLAMINGO" but wrong number) |
-| 0.00 | Failure — code word not found |
-| ⚠️ | Hallucination — model returned a *different* code word confidently |
-
----
-
-## Context lengths and defaults
-
-| Mode | Context lengths | Depths | Cells |
-|------|----------------|--------|-------|
-| `--quick` | 4k, 16k, 32k, 64k | 10%, 50%, 90% | 12 |
-| Full | 1k, 2k, 4k, 8k, 16k, 32k, 64k, 128k | 0%, 10%, 25%, 50%, 75%, 90%, 100% | 56 |
-
-Context lengths exceeding the model's maximum are skipped automatically.
-
----
-
-## Adding a new model
-
-Extend `BaseAdapter` in [llm_stress_test/models.py](llm_stress_test/models.py):
-
-```python
-class MyProviderAdapter(BaseAdapter):
-    def complete(self, system: str, user: str, max_tokens: int = 256) -> ModelResponse:
-        # call your API here
-        return ModelResponse(content="...", input_tokens=0, output_tokens=0, model=self.model)
-```
-
-Then register it in `get_adapter()`.
-
----
-
-## Community leaderboard
-
-Run the test against your model and submit your results to [RESULTS.md](RESULTS.md) via PR. See that file for the table format.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Submit stress test results to [RESULTS.md](RESULTS.md) — the more models we cover, the better the risk tables get.
